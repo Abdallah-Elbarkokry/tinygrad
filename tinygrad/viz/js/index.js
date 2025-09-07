@@ -228,15 +228,14 @@ async function renderProfiler() {
           const stepIdx = ctxs[ref.ctx+1].steps.findIndex((s, i) => i >= start && s.name == e.name);
           ref = stepIdx === -1 ? null : {ctx:ref.ctx, step:stepIdx};
         }
-        const arg = { tooltipText:formatTime(e.dur)+(e.info != null ? "\n"+e.info : ""), ...ref };
+        const htmlLabel = label.map(({color, st}) => `<span style="color:${color}">${st}</span>`).join('');
+        const arg = { tooltipText:htmlLabel+"\n"+formatTime(e.dur)+(e.info != null ? "\n"+e.info : ""), ...ref };
         // offset y by depth
         shapes.push({x:e.st, y:levelHeight*depth, width:e.dur, height:levelHeight, arg, label, fillColor });
       }
       div.style("height", levelHeight*levels.length+padding+"px").style("pointerEvents", "none");
     } else {
       const peak = u64();
-      const height = heightScale(peak);
-      const yscale = d3.scaleLinear().domain([0, peak]).range([height, 0]);
       let x = 0, y = 0;
       const buf_shapes = new Map(), temp = new Map();
       const timestamps = [];
@@ -267,6 +266,8 @@ async function renderProfiler() {
         v.y.push(v.y.at(-1));
       }
       timestamps.push(dur);
+      const height = heightScale(peak);
+      const yscale = d3.scaleLinear().domain([0, peak]).range([height, 0]);
       for (const [_, {dtype, sz, nbytes, y, x:steps}] of buf_shapes) {
         const x = steps.map(s => timestamps[s]);
         const arg = {tooltipText:`${dtype} len:${formatUnit(sz)}\n${formatUnit(nbytes, "B")}`};
@@ -300,7 +301,6 @@ async function renderProfiler() {
     const xscale = d3.scaleLinear().domain([0, dur]).range([0, canvas.clientWidth]);
     const visibleX = xscale.range().map(zoomLevel.invertX, zoomLevel).map(xscale.invert, xscale);
     xscale.domain(visibleX);
-    const yscale = data.axes.y != null ? d3.scaleLinear().domain(data.axes.y.domain).range(data.axes.y.range) : null;
     // draw shapes
     for (const [_, { offsetY, shapes }] of data.tracks) {
       for (const e of shapes) {
@@ -318,12 +318,8 @@ async function renderProfiler() {
           p.closePath();
           ctx.fill(p);
           // NOTE: y coordinates are in reverse order
-          for (let i = 0; i < x.length - 1; i++) {
-            let tooltipText = e.arg.tooltipText;
-            if (yscale != null && ((yaxisVal=yscale.invert(offsetY+e.y1[i]))>0)) {
-              tooltipText += `\nTotal: ${formatUnit(yaxisVal, data.axes.y.fmt)}`;
-            }
-            rectLst.push({ x0:x[i], x1:x[i+1], y0:offsetY+e.y1[i], y1:offsetY+e.y0[i], arg:{...e.arg, tooltipText} });
+          for (let i = 0; i<x.length-1; i++) {
+            rectLst.push({ x0:x[i], x1:x[i+1], y0:offsetY+e.y1[i], y1:offsetY+e.y0[i], arg:e.arg });
           }
           continue;
         }
@@ -360,8 +356,9 @@ async function renderProfiler() {
       ctx.textBaseline = "top";
       ctx.fillText(formatTime(tick, dur), x+ctx.lineWidth+2, tickSize);
     }
-    if (yscale != null) {
-      drawLine(ctx, [0, 0], yscale.range());
+    if (data.axes.y != null) {
+      drawLine(ctx, [0, 0], data.axes.y.range);
+      const yscale = d3.scaleLinear().domain(data.axes.y.domain).range(data.axes.y.range);
       for (const tick of yscale.ticks()) {
         const y = yscale(tick);
         drawLine(ctx, [0, tickSize], [y, y]);
@@ -379,9 +376,9 @@ async function renderProfiler() {
 
   function resize() {
     const profiler = document.querySelector(".profiler");
-    // NOTE: use clientWidth to account for the scrollbar
-    let [width, height] = [profiler.clientWidth, profiler.scrollHeight];
-    width -= rect("#device-list").width+padding;
+    const sideRect = rect("#device-list");
+    const width = profiler.clientWidth-(sideRect.width+padding), height = Math.round(sideRect.height);
+    if (canvas.width === width*dpr && canvas.height === height*dpr) return;
     canvas.width = width*dpr;
     canvas.height = height*dpr;
     canvas.style.height = `${height}px`;
@@ -394,8 +391,7 @@ async function renderProfiler() {
   d3.select(canvas).call(canvasZoom);
   document.addEventListener("contextmenu", e => e.ctrlKey && e.preventDefault());
 
-  resize();
-  window.addEventListener("resize", resize);
+  new ResizeObserver(([e]) => e.contentRect.width > 0 && resize()).observe(profiler.node());
 
   function findRectAtPosition(x, y) {
     const { top, left, width, height } = rect(canvas);
@@ -419,7 +415,7 @@ async function renderProfiler() {
       tooltip.style.display = "block";
       tooltip.style.left = (e.pageX+10)+"px";
       tooltip.style.top = (e.pageY)+"px";
-      tooltip.innerText = foundRect.tooltipText;
+      tooltip.innerHTML = foundRect.tooltipText;
     } else tooltip.style.display = "none";
   });
   canvas.addEventListener("mouseleave", () => document.getElementById("tooltip").style.display = "none");
