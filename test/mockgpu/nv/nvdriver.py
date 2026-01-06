@@ -1,5 +1,5 @@
 import ctypes, mmap, collections, functools, os
-import tinygrad.runtime.autogen.nv_gpu as nv_gpu
+from tinygrad.runtime.autogen import nv_570 as nv_gpu
 from typing import Any
 from tinygrad.helpers import to_mv
 from test.mockgpu.driver import VirtDriver, VirtFileDesc, VirtFile
@@ -15,7 +15,7 @@ libc.munmap.restype = ctypes.c_int
 NVSubDevice = collections.namedtuple('NVSubDevice', ['device'])
 NVUserMode = collections.namedtuple('NVUserMode', ['subdevice'])
 NVVASpace = collections.namedtuple('NVVASpace', ['device'])
-NVAllocation = collections.namedtuple('NVAllocation', ['device', 'size'])
+NVAllocation = collections.namedtuple('NVAllocation', ['device', 'size', 'is_signal'])
 NVChannelGroup = collections.namedtuple('NVChannelGroup', ['device'])
 NVContextShare = collections.namedtuple('NVContextShare', ['channel_group'])
 NVGPFIFO = collections.namedtuple('NVGPFIFO', ['device', 'token'])
@@ -41,12 +41,14 @@ class NVDevFileDesc(VirtFileDesc):
     super().__init__(fd)
     self.driver, self.gpu = driver, gpu
     self._mapping_userland = False
+    self._mapping_signal = False
 
   def ioctl(self, fd, request, argp): return self.driver.dev_ioctl(self.gpu, request, argp)
   def mmap(self, start, sz, prot, flags, fd, offset):
     start = libc.mmap(start, sz, prot, flags|mmap.MAP_ANONYMOUS, -1, 0)
-    if self._mapping_userland:
+    if self._mapping_userland or self._mapping_signal:
       self.driver.track_address(start, start+sz, lambda mv,off: None, lambda mv, off: self.driver._gpu_mmio_write(mv, off, self.gpu))
+      self._mapping_signal = False
     return start
 
 class NVDriver(VirtDriver):
@@ -65,6 +67,7 @@ class NVDriver(VirtDriver):
     self.object_by_handle = {}
     self.opened_fds = {}
     self.next_doorbell = collections.defaultdict(int)
+    self._executing = False  # re-entrancy guard for _gpu_mmio_write
 
     for i in range(gpus): self._prepare_gpu(i)
 
@@ -100,6 +103,9 @@ class NVDriver(VirtDriver):
       assert struct.hObjectParent in self.object_by_handle and isinstance(self.object_by_handle[struct.hObjectParent], NVGPU)
       struct.hObjectNew = self._alloc_handle()
       self.object_by_handle[struct.hObjectNew] = NVSubDevice(self.object_by_handle[struct.hObjectParent])
+    elif struct.hClass == nv_gpu.NV01_MEMORY_VIRTUAL:
+      assert struct.hObjectParent in self.object_by_handle and isinstance(self.object_by_handle[struct.hObjectParent], NVGPU)
+      struct.hObjectNew = self._alloc_handle()
     elif struct.hClass == nv_gpu.TURING_USERMODE_A:
       assert struct.hObjectParent in self.object_by_handle and isinstance(self.object_by_handle[struct.hObjectParent], NVSubDevice)
       struct.hObjectNew = self._alloc_handle()
@@ -112,7 +118,8 @@ class NVDriver(VirtDriver):
       assert struct.hObjectParent in self.object_by_handle and isinstance(self.object_by_handle[struct.hObjectParent], NVGPU)
       params = nv_gpu.NV_MEMORY_ALLOCATION_PARAMS.from_address(params_ptr)
       struct.hObjectNew = self._alloc_handle()
-      self.object_by_handle[struct.hObjectNew] = NVAllocation(self.object_by_handle[struct.hObjectParent], params.size)
+      is_signal = struct.hClass == nv_gpu.NV1_MEMORY_SYSTEM  # signal memory uses NV1_MEMORY_SYSTEM (uncached)
+      self.object_by_handle[struct.hObjectNew] = NVAllocation(self.object_by_handle[struct.hObjectParent], params.size, is_signal)
     elif struct.hClass == nv_gpu.KEPLER_CHANNEL_GROUP_A:
       assert struct.hObjectParent in self.object_by_handle and isinstance(self.object_by_handle[struct.hObjectParent], NVGPU)
       struct.hObjectNew = self._alloc_handle()
@@ -153,8 +160,10 @@ class NVDriver(VirtDriver):
                  51059, 51069, 51071, 51632, 51639, 51639, 51706, 52019, 222, 50287, 50273, 50031, 50017] # from ada102
       params.numClasses = len(classes)
       if struct.cmd == nv_gpu.NV0080_CTRL_CMD_GPU_GET_CLASSLIST:
-        clslist = to_mv(params.classList, params.numClasses * 4).cast('I')
-        for i,c in enumerate(classes): clslist[i] = c
+        if params.classList and params.numClasses > 0:
+          clslist = to_mv(params.classList, params.numClasses * 4).cast('I')
+          for i,c in enumerate(classes): clslist[i] = c
+        else: params.numClasses = len(classes)
       else:
         for i,c in enumerate(classes): params.classList[i] = c
     elif struct.cmd == nv_gpu.NV2080_CTRL_CMD_GR_GET_INFO:
@@ -192,13 +201,15 @@ class NVDriver(VirtDriver):
       params.mmuFaultInfoList[0].faultAddress = int(os.environ['MOCKGPU_EMU_FAULTADDR'], base=16)
       params.mmuFaultInfoList[0].faultType = 1
       params.mmuFaultInfoList[0].accessType = 1
+    elif struct.cmd == nv_gpu.NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION_V2:
+      params = nv_gpu.NV0000_CTRL_SYSTEM_GET_BUILD_VERSION_V2_PARAMS.from_address(params_ptr)
+      params.driverVersionBuffer = b"570.00.00\0"
     else: raise RuntimeError(f"Unknown {struct.cmd} to rm_control")
     return 0
 
   def ctl_ioctl(self, req, argp):
     nr = req & 0xff
     if nr == nv_gpu.NV_ESC_RM_ALLOC: return self.rm_alloc(argp)
-    elif nr == nv_gpu.NV_ESC_RM_ALLOC_MEMORY: pass
     elif nr == nv_gpu.NV_ESC_RM_CONTROL: return self.rm_control(argp)
     elif nr == nv_gpu.NV_ESC_RM_MAP_MEMORY:
       st:Any = nv_gpu.nv_ioctl_nvos33_parameters_with_fd.from_address(argp)
@@ -207,9 +218,15 @@ class NVDriver(VirtDriver):
         file = self.opened_fds[st.fd]
         assert isinstance(file, NVDevFileDesc)
         file._mapping_userland = True
+      elif isinstance(obj, NVAllocation) and obj.is_signal:
+        file = self.opened_fds[st.fd]
+        assert isinstance(file, NVDevFileDesc)
+        file._mapping_signal = True
     elif nr == nv_gpu.NV_ESC_RM_FREE:
       st = nv_gpu.NVOS00_PARAMETERS.from_address(argp)
       self.object_by_handle.pop(st.hObjectOld)
+    elif nr == nv_gpu.NV_ESC_RM_MAP_MEMORY_DMA:
+      pass # mappings are same as uvm
     elif nr == nv_gpu.NV_ESC_CARD_INFO:
       for i,gpu in enumerate(self.gpus.values()):
         st = nv_gpu.nv_ioctl_card_info_t.from_address(argp + i * ctypes.sizeof(nv_gpu.nv_ioctl_card_info_t))
@@ -246,12 +263,26 @@ class NVDriver(VirtDriver):
     else: raise RuntimeError(f"Unknown {nr} to nvidia-uvm")
     return 0
 
-  def dev_ioctl(self, dev, req, argp): return 0
+  def dev_ioctl(self, dev, req, argp):
+    nr = req & 0xff
+    # Handle NV_ESC_RM_ALLOC_MEMORY for host/signal memory
+    if nr == nv_gpu.NV_ESC_RM_ALLOC_MEMORY:
+      st:Any = nv_gpu.nv_ioctl_nvos02_parameters_with_fd.from_address(argp)
+      # Track host memory (signal memory) - progress queues when written to
+      if st.params.hClass == nv_gpu.NV01_MEMORY_SYSTEM_OS_DESCRIPTOR:
+        self.track_address(st.params.pMemory, st.params.pMemory + st.params.limit + 1,
+                           lambda mv,off: None, lambda mv, off: self._gpu_mmio_write(mv, off, None))
+    return 0
   def _gpu_mmio_write(self, mv, off, gpu):
-    any_progress = True
-    while any_progress:
-      any_progress = False
-      for gpu in self.gpus.values():
-        for q in gpu.queues:
-          if q.ctrl.GPGet != q.ctrl.GPPut:
-            any_progress |= q.execute()
+    if self._executing: return  # prevent re-entrancy
+    self._executing = True
+    try:
+      any_progress = True
+      while any_progress:
+        any_progress = False
+        for gpu in self.gpus.values():
+          for q in gpu.queues:
+            if q.ctrl.GPGet != q.ctrl.GPPut:
+              any_progress |= q.execute()
+    finally:
+      self._executing = False

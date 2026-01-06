@@ -223,35 +223,33 @@ def xlog2(d:UOp) -> UOp:
   Paper: https://arxiv.org/pdf/2001.09258 5.5
   """
   assert d.dtype.scalar() in TRANSCENDENTAL_DTYPES
-  # TODO: float16 denormal need float32 to achieve precision
-  if d.dtype.scalar() == dtypes.float16: return xlog2(d.cast(dtypes.float32)).cast(dtypes.float16)
-  FLT_MIN = d.const_like(1e-6 if d.dtype.scalar() == dtypes.float16 else 1e-4)
+  # float16 uses 2^10 for denormal scaling (2^64 overflows), float32/64 use 2^64
+  denormal_exp = 10 if d.dtype.scalar() == dtypes.float16 else 64
+  FLT_MIN = d.const_like({dtypes.float16: 6.1e-5, dtypes.float32: 1e-4, dtypes.float64: 1e-4}[d.dtype.scalar()])
   is_denormal = d<FLT_MIN
-  a = is_denormal.where(d * (2 ** 64), d)
+  a = is_denormal.where(d * (2 ** denormal_exp), d)
 
   e = ilogb2k(a * (1.0 / 0.75)).cast(a.dtype)
   m = ldexp3k(a, -e)
-  e = is_denormal.where(e - 64, e)
+  e = is_denormal.where(e - denormal_exp, e)
 
   x = (m - 1.0) / (m + 1.0)
   x2 = x * x
   if d.dtype.scalar() == dtypes.float64:
     t = polyN(x2, [0.2211941750456081490e+0, 0.2200768693152277689e+0, 0.2623708057488514656e+0, 0.3205977477944495502e+0,
                    0.4121985945485324709e+0, 0.5770780162997058982e+0, 0.96179669392608091449])
-    s_hi, s_lo = e+x*2.885390081777926774, e.const_like(0)
+    r = t * (x * x2) + e + x * 2.885390081777926774
   else:
     t = polyN(x2, [0.4374550283e+0, 0.5764790177e+0, 0.9618012905120])
-    s_hi, s_lo = e+x*2.8853900432586669922, x*3.2734474483568488616e-08
-  r = t * (x * x2) + (s_hi + s_lo)
+    # s_lo term (x*3.27e-08) only for float32 - underflows in float16
+    r = t * (x * x2) + e + x * 2.8853900432586669922 + (x * 3.2734474483568488616e-08 if d.dtype.scalar() == dtypes.float32 else 0)
 
   # log2(Inf) = Inf
   r = d.ne(math.inf).where(r, r.const_like(math.inf))
+  # log2(0) = -Inf (handle both +0.0 and -0.0)
+  r = d.ne(0.0).where(r, r.const_like(-math.inf))
   # log2(x) = NaN for x < 0
   r = (d<-0.0).where(r.const_like(math.nan), r)
-  # log2(0) = -Inf, but we will compare using the value of y because 1e-200==0 is true.
-  # log2_zero = the value of unmasked xlog2(0.0).
-  log2_zero = {dtypes.float64: -1087, dtypes.float32: -191, dtypes.float16: -79}[d.dtype.scalar()]
-  r = r.ne(log2_zero).where(r, r.const_like(-math.inf))
   # log2(NaN) = NaN
   r = d.ne(d).where(r.const_like(math.nan), r)
   # log2(-0.0) = -Inf. In certain devices like PTX, x == -0.0 won't be true. so making reciprocal.
@@ -282,7 +280,7 @@ def magicgu(vmax:int, d:int) -> tuple[int,int]:
 
 def fast_idiv(device: str, x: UOp, d: int, dont_cast=False) -> UOp|None:
   # If d is a power of two this is not valid for signed ints!
-  is_unsigned = True if x.vmin>=0 or x.dtype in dtypes.uints else False
+  is_unsigned = x.vmin>=0 or x.dtype in dtypes.uints
   assert d>0, "Sign should have been taken out of divisor"
   vmin,vmax = max(x.vmin, x.dtype.min), min(x.vmax, x.dtype.max)
   m,s = magicgu(max(vmax, abs(vmin)), d)
@@ -293,7 +291,7 @@ def fast_idiv(device: str, x: UOp, d: int, dont_cast=False) -> UOp|None:
     if (ret:=fast_idiv(device, x//largest_factor_of_two_in_d, d//largest_factor_of_two_in_d, dont_cast=True)) is not None: return ret
   if dont_cast: return None
   # promo_lattice needs to return an unsigned type if the type is unsigned
-  if dtypes.is_int(next_dtype := promo_lattice[x.dtype][-1]) and is_dtype_supported(next_dtype, None if device=='' else device):
+  if dtypes.is_int(next_dtype := promo_lattice[x.dtype.scalar()][-1]) and is_dtype_supported(next_dtype, device):
     if m*vmin >= dtypes.min(next_dtype) and m*vmax <= dtypes.max(next_dtype):
       return ((x.cast(next_dtype)*m) >> s).cast(x.dtype) if is_unsigned else ((x.cast(next_dtype)*m) >> s).cast(x.dtype) + (x<0).where(x.ufix(1), 0)
   return None
@@ -318,7 +316,7 @@ def threefry2x32(x: UOp, key: UOp):
 
 powers_of_two = {2**i:i for i in range(64)}
 @functools.cache
-def get_late_rewrite_patterns(ops:tuple[Ops, ...], force_transcendental=False):
+def get_late_rewrite_patterns(ops:tuple[Ops, ...], force_transcendental):
   pat: list[tuple[UPat, Callable]] = []
   for op,f in ((Ops.EXP2, xexp2), (Ops.LOG2, xlog2), (Ops.SIN, xsin)):
     if op not in ops or force_transcendental:
@@ -343,7 +341,7 @@ def get_late_rewrite_patterns(ops:tuple[Ops, ...], force_transcendental=False):
     pat += [(UPat.var("x", dtypes.ints)//UPat.cvar("c"), lambda x,c: (x+(l.const_like(l.vmin) if (l:=(x<0)).vmin==l.vmax else l).where(
       c-1, 0)) >> v if (v:=powers_of_two.get(c.arg, 0)) else None)]  # (x+(x<0).where(c-1, 0)) >> v
     if not DISABLE_FAST_IDIV:
-      pat += [(UPat.var("x", dtypes.ints)//UPat.cvar("d"), lambda ctx, x, d: fast_idiv(ctx, x, d.arg))]
+      pat += [(UPat.var("x", dtypes.ints)//UPat.cvar("d", vec=False), lambda ctx, x, d: fast_idiv(ctx, x, d.arg))]
       pat += [(UPat.var("x", dtypes.ints)%UPat.var("d"), lambda x, d: x-d*(x//d))]
   if Ops.NEG in ops:
     pat += [(UPat.var('x')*-1, lambda x: x.alu(Ops.NEG))]

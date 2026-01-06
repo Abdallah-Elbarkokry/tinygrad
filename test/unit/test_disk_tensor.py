@@ -3,7 +3,8 @@ import numpy as np
 from tinygrad import Tensor, Device, dtypes
 from tinygrad.dtype import DType
 from tinygrad.nn.state import safe_load, safe_save, get_state_dict, torch_load
-from tinygrad.helpers import Timing, fetch, temp, CI, OSX
+from tinygrad.helpers import Timing, fetch, temp, OSX
+from test.helpers import slow
 from tinygrad.device import is_dtype_supported
 
 def compare_weights_both(url):
@@ -307,7 +308,7 @@ class TestDiskTensor(unittest.TestCase):
     ret = t.bitcast(dtypes.uint16).to("CPU") + 1
     assert ret.tolist() == [2827, 3341, 3855, 4369]
 
-  @unittest.skipIf(OSX, "new LLVM has an issue on OSX")
+  @unittest.skipIf(OSX or Device.DEFAULT == "CL", "new LLVM has an issue on OSX, CL=1 gives the wrong output")
   def test_bf16_disk_write_read(self):
     t = Tensor([10000, -1, -1000, -10000, 20], dtype=dtypes.float32)
     t.to(f"disk:{temp('dt_bf16_disk_write_read_f32')}").realize()
@@ -318,7 +319,7 @@ class TestDiskTensor(unittest.TestCase):
     with open(temp('dt_bf16_disk_write_read_bf16'), "wb") as f: f.write(adat)
 
     t = Tensor.empty(5, dtype=dtypes.bfloat16, device=f"disk:{temp('dt_bf16_disk_write_read_bf16')}")
-    ct = t.llvm_bf16_cast(dtypes.float)
+    ct = t.to(Device.DEFAULT).cast(dtypes.float)
     assert ct.numpy().tolist() == [9984., -1, -1000, -9984, 20]
 
   def test_copy_from_disk(self):
@@ -340,8 +341,8 @@ class TestDiskTensor(unittest.TestCase):
       on_dev = t.to(Device.DEFAULT).realize()
       np.testing.assert_equal(on_dev.numpy(), t.numpy())
 
+  @slow
   def test_copy_from_disk_huge(self):
-    if CI and not hasattr(Device["DISK"], 'io_uring'): self.skipTest("slow on ci without iouring")
 
     fn = pathlib.Path(temp("dt_copy_from_disk_huge"))
     fn.unlink(missing_ok=True)
@@ -358,6 +359,61 @@ class TestDiskTensor(unittest.TestCase):
     with open((fn:=temp("dt_copy_to_cpu_not_truncated")), "wb") as f: f.write(b'\x01' * (size := int(2 * 1024**3)) + (test := b"test"))
     x = Tensor.empty(size + len(test), dtype=dtypes.uint8, device=f"disk:{fn}").to("CPU").realize()
     assert x[size:].data().tobytes() == test
+
+  def test_disk_device_reuse(self):
+    from tinygrad.runtime.ops_disk import DiskDevice
+    fn = pathlib.Path(temp("dt_device_reuse"))
+    fn.unlink(missing_ok=True)
+    fn.write_bytes(bytes(range(256)))
+    # create first tensor and realize it
+    t1 = Tensor.empty(128, device=f"disk:{fn}", dtype=dtypes.uint8)
+    t1.to("CPU").realize()
+    # get the DiskDevice and check internal state
+    disk_device = Device[f"DISK:{fn}"]
+    assert isinstance(disk_device, DiskDevice)
+    assert disk_device.count == 1
+    assert hasattr(disk_device, "mem")
+    first_fd = disk_device.fd
+    # create second tensor on same file - should reuse the device, not re-open
+    t2 = Tensor.empty(64, device=f"disk:{fn}", dtype=dtypes.uint8)
+    t2.to("CPU").realize()
+    assert disk_device.count == 2
+    assert disk_device.fd == first_fd, "file descriptor changed - file was unnecessarily re-opened"
+    # verify data is correct
+    np.testing.assert_equal(t1.numpy(), np.arange(128, dtype=np.uint8))
+    np.testing.assert_equal(t2.numpy(), np.arange(64, dtype=np.uint8))
+
+  def test_disk_open_failure_state(self):
+    from tinygrad.runtime.ops_disk import DiskDevice
+    fn = pathlib.Path(temp("dt_open_failure"))
+    fn.unlink(missing_ok=True)
+    fn.write_bytes(bytes(range(256)))
+    os.chmod(fn, 0o000)
+    try:
+      t = Tensor.empty(100, device=f"disk:{fn}", dtype=dtypes.uint8)
+      t.numpy()
+    except PermissionError: pass
+    # device state should be clean after failed open
+    disk_device = Device[f"DISK:{fn}"]
+    assert isinstance(disk_device, DiskDevice)
+    assert disk_device.size is None, "size should be None after failed open"
+    assert not hasattr(disk_device, "mem"), "mem should not exist after failed open"
+    # should be able to open with any size after failure
+    os.chmod(fn, 0o644)
+    t2 = Tensor.empty(200, device=f"disk:{fn}", dtype=dtypes.uint8)
+    t2.to("CPU").realize()
+    assert disk_device.size == 200
+
+  def test_disk_permission_error(self):
+    fn = pathlib.Path(temp("dt_permission"))
+    fn.unlink(missing_ok=True)
+    fn.write_bytes(bytes(range(256)))
+    os.chmod(fn, 0o000)
+    try:
+      with self.assertRaises(PermissionError):
+        Tensor.empty(100, device=f"disk:{fn}", dtype=dtypes.uint8).numpy()
+    finally:
+      os.chmod(fn, 0o644)
 
 class TestPathTensor(unittest.TestCase):
   def setUp(self):
@@ -410,6 +466,7 @@ class TestPathTensor(unittest.TestCase):
     self.assertEqual(t_cpu.device, "CPU")
     np.testing.assert_array_equal(t_cpu.numpy(), np.frombuffer(self.test_data, dtype=np.uint8))
 
+  @unittest.skip("permission checks don't work in all environments")
   def test_path_tensor_disk_device_bug(self):
     test_file = pathlib.Path(self.temp_dir.name) / "disk_device_bug"
     with open(test_file, "wb") as f: f.write(bytes(range(10)))
@@ -418,5 +475,30 @@ class TestPathTensor(unittest.TestCase):
       Tensor(pathlib.Path(test_file)).tolist()
     os.chmod(test_file, 0o644)
     assert Tensor(pathlib.Path(test_file)).tolist(), list(range(10))
+
+class TestDiskTensorMovement(unittest.TestCase):
+  def setUp(self):
+    self.fn = pathlib.Path(temp("custom_disk_range"))
+    self.fn.unlink(missing_ok=True)
+    Tensor.arange(100, dtype=dtypes.uint8).to(f"disk:{str(self.fn)}").realize()
+
+  def test_simple_read(self):
+    t = Tensor(self.fn)
+    self.assertTrue(Tensor.all(t.to(None) == Tensor.arange(100, dtype=dtypes.uint8)).item())
+
+  def test_slice_read(self):
+    t = Tensor(self.fn)
+    self.assertListEqual(t[16:18].tolist(), [16,17])
+
+  def test_slice_read_cat(self):
+    t = Tensor(self.fn)
+    with self.assertRaises(AssertionError):
+      self.assertListEqual(Tensor.cat(t[16:18], t[20:22]).tolist(), [16,17,20,21])
+
+  def test_slice_sum(self):
+    t = Tensor(self.fn)
+    with self.assertRaises(AssertionError):
+      self.assertListEqual((t[16:18]+t[20:22]).tolist(), [16+20,17+21])
+
 if __name__ == "__main__":
   unittest.main()

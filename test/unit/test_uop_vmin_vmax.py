@@ -1,6 +1,6 @@
 import unittest, math
 from tinygrad.uop.ops import UOp, Ops
-from tinygrad.dtype import dtypes
+from tinygrad.dtype import dtypes, Invalid
 
 class TestVminVmaxProperties(unittest.TestCase):
   def test_vmin_vmax_constant(self):
@@ -40,15 +40,14 @@ class TestVminVmaxProperties(unittest.TestCase):
     self.assertEqual(uop.vmin, 0)
     self.assertEqual(uop.vmax, 5)
 
-    # this can be improved
     uop = x & 15
     self.assertEqual(uop.vmin, 0)
     self.assertEqual(uop.vmax, 15)
 
-    # this can be improved
+    # TODO: this can be improved
     uop = x & 32
     self.assertEqual(uop.vmin, 0)
-    self.assertEqual(uop.vmax, 20)
+    self.assertEqual(uop.vmax, 20) # shoud be 0
 
   def test_vmin_vmax_multiplication_with_variable(self):
     # vmin and vmax for multiplication with a variable
@@ -121,6 +120,15 @@ class TestVminVmaxProperties(unittest.TestCase):
     x_uint = x.cast(dtypes.uint)
     self.assertEqual(x_uint.vmin, dtypes.min(dtypes.uint))
     self.assertEqual(x_uint.vmax, dtypes.max(dtypes.uint))
+
+  def test_vmin_vmax_invalid(self):
+    i = UOp.invalid()
+    self.assertNotEqual(i.vmin, i.vmax)
+
+  def test_vmin_vmax_invalid_vconst(self):
+    x = UOp.const(dtypes.index.vec(4), (0, 4, Invalid, Invalid))
+    self.assertLess(x.vmin, 0)
+    self.assertGreater(x.vmax, 4)
 
 class TestVminVmaxDivMod(unittest.TestCase):
   def test_vmin_vmax_division_positive(self):
